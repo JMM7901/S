@@ -196,6 +196,73 @@ def deskew_image(pil_image):
         img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
     return img
 
+
+def order_points(pts):
+    """Sorts corners into: Top-Left, Top-Right, Bottom-Right, Bottom-Left"""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)] # Top-Left has smallest x+y
+    rect[2] = pts[np.argmax(s)] # Bottom-Right has largest x+y
+    
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)] # Top-Right has smallest x-y
+    rect[3] = pts[np.argmax(diff)] # Bottom-Left has largest x-y
+    return rect
+
+def get_document_corners(image, debug_name="Image"):
+    """Finds the largest 4-corner bounding box in the image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 75, 200) # Find edges
+
+    # Find contours and sort by size (largest first)
+    cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
+
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True) # Approximate the shape
+
+        # If the largest shape has 4 points, we assume it's our form's outer border!
+        if len(approx) == 4:
+            if DEBUG_MODE:
+                debug_canvas = image.copy()
+                cv2.drawContours(debug_canvas, [approx], -1, (0, 255, 0), 10)
+                show_debug_image(f"Found Outer Box: {debug_name}", debug_canvas)
+            return order_points(approx.reshape(4, 2))
+            
+    raise ValueError(f"Could not find a clean 4-corner bounding box for {debug_name}.")
+
+def preprocess_and_align(target_path, template_path):
+    # 1. Load Images
+    pil_img = Image.open(target_path)
+    deskewed_cv_img = deskew_image(pil_img)
+    target_img = standardize_image_size(deskewed_cv_img)
+    
+    template_img_raw = cv2.imread(template_path, cv2.IMREAD_COLOR)
+    template_img = standardize_image_size(template_img_raw)
+
+    # 2. Find the 4 corners of the outer box in BOTH images
+    try:
+        target_corners = get_document_corners(target_img, "Filled Target Form")
+        template_corners = get_document_corners(template_img, "Blank Template")
+    except ValueError as e:
+        # Fallback: If it's a terrible scan and it can't find the box, 
+        # just return the standardized image and hope the coordinates hit.
+        print(f"Warning: {e} Falling back to raw resize.")
+        return target_img 
+
+    # 3. Calculate the Perspective Transform Matrix (The CamScanner Math)
+    # Instead of Homography with 1,000 messy points, we use exactly 4 perfect points.
+    transform_matrix = cv2.getPerspectiveTransform(target_corners, template_corners)
+
+    # 4. Warp the Target to perfectly match the Template
+    aligned_img = cv2.warpPerspective(target_img, transform_matrix, (TARGET_WIDTH, TARGET_HEIGHT))
+    
+    show_alignment_overlay(aligned_img, template_img)
+    return aligned_img
+
+
 def standardize_image_size(img):
     return cv2.resize(img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_CUBIC)
 
