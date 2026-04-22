@@ -210,28 +210,60 @@ def order_points(pts):
     return rect
 
 def get_document_corners(image, debug_name="Image"):
-    """Finds the largest 4-corner bounding box in the image."""
+    """Isolates horizontal and vertical lines to find the form's grid bounding box."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 75, 200) # Find edges
+    
+    # 1. Binarize the image (Black background, White lines/text)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
 
-    # Find contours and sort by size (largest first)
-    cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
+    # 2. Define the minimum length a line must be to be considered part of the grid
+    # For a 2550x3300 image, a grid line should be at least ~50 pixels long
+    line_min_length = max(image.shape[1], image.shape[0]) // 50
 
-    for c in cnts:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True) # Approximate the shape
+    # 3. Extract purely VERTICAL lines
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, line_min_length))
+    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
 
-        # If the largest shape has 4 points, we assume it's our form's outer border!
-        if len(approx) == 4:
-            if DEBUG_MODE:
-                debug_canvas = image.copy()
-                cv2.drawContours(debug_canvas, [approx], -1, (0, 255, 0), 10)
-                show_debug_image(f"Found Outer Box: {debug_name}", debug_canvas)
-            return order_points(approx.reshape(4, 2))
-            
-    raise ValueError(f"Could not find a clean 4-corner bounding box for {debug_name}.")
+    # 4. Extract purely HORIZONTAL lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (line_min_length, 1))
+    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+
+    # 5. Merge them into a single "Skeleton Grid"
+    grid_mask = cv2.addWeighted(vertical_lines, 0.5, horizontal_lines, 0.5, 0.0)
+    grid_mask = cv2.threshold(grid_mask, 50, 255, cv2.THRESH_BINARY)[1]
+
+    # Dilate the grid slightly to connect any dashed lines or broken intersections
+    join_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    grid_mask = cv2.dilate(grid_mask, join_kernel, iterations=2)
+
+    # --- DEBUG: Show the Grid Skeleton ---
+    if DEBUG_MODE:
+        show_debug_image(f"DEBUG: Skeleton Grid for {debug_name}", grid_mask)
+    # -------------------------------------
+
+    # 6. Find the largest shape on this clean grid
+    cnts, _ = cv2.findContours(grid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not cnts:
+        raise ValueError(f"Could not find any grid lines in {debug_name}.")
+        
+    # Sort by area and grab the absolute largest contour (The Outer Box)
+    largest_contour = max(cnts, key=cv2.contourArea)
+
+    # 7. Get the Rotated Bounding Box (Mathematically guarantees 4 extreme corners)
+    rect = cv2.minAreaRect(largest_contour)
+    box = cv2.boxPoints(rect)
+    box = np.float32(box) # Convert to standard floats for OpenCV
+
+    # --- DEBUG: Show the Final Found Box ---
+    if DEBUG_MODE:
+        debug_canvas = image.copy()
+        cv2.drawContours(debug_canvas, [np.int32(box)], 0, (0, 255, 0), 10)
+        show_debug_image(f"Found Outer Bounds: {debug_name}", debug_canvas)
+    # ---------------------------------------
+
+    # Order the points: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+    return order_points(box)
 
 def preprocess_and_align(target_path, template_path):
     # 1. Load Images
