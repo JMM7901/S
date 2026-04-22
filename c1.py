@@ -250,11 +250,17 @@ def extract_zonal_data(aligned_img, form_type):
     if DEBUG_MODE:
         debug_canvas = aligned_img.copy()
         for field_name, box in coords.items():
-            cv2.rectangle(debug_canvas, (box['x1'], box['y1']), (box['x2'], box['y2']), (0, 0, 255), 4)
-        show_debug_image("STEP 3: Cropping Zones Preview", debug_canvas)
+            # Draw blue boxes for LLM, red for Tesseract
+            color = (255, 0, 0) if box['type'] == 'llm' else (0, 0, 255)
+            cv2.rectangle(debug_canvas, (box['x1'], box['y1']), (box['x2'], box['y2']), color, 4)
+        show_debug_image("STEP 3: Cropping Zones (Blue=LLM, Red=Tesseract)", debug_canvas)
     # ---------------------------
 
     raw_data = {}
+    vision_in_tokens = 0
+    vision_out_tokens = 0
+    model = genai.GenerativeModel('gemini-1.5-flash') # Initialize vision model once
+
     for field_name, box in coords.items():
         x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
         w, h = x2 - x1, y2 - y1
@@ -262,15 +268,25 @@ def extract_zonal_data(aligned_img, form_type):
         
         crop = aligned_img[max(0, y1-pad_y) : y2+pad_y, max(0, x1-pad_x) : x2+pad_x]
         
+        # ROUTE 1: Fast & Free Tesseract
         if box['type'] == 'text':
             raw_data[field_name] = pytesseract.image_to_string(crop, config='--psm 6').strip()
-        elif box['type'] == 'checkbox':
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-            density = cv2.countNonZero(binary) / (binary.shape[0] * binary.shape[1])
-            raw_data[field_name] = "YES" if density > 0.15 else "NO"
             
-    return raw_data
+        # ROUTE 2: Advanced LLM Vision
+        elif box['type'] == 'llm':
+            # Convert OpenCV (BGR) to PIL (RGB) for Gemini
+            rgb_img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb_img)
+            
+            # Send the cropped image + the specific prompt
+            response = model.generate_content([box['prompt'], pil_img])
+            raw_data[field_name] = response.text.strip()
+            
+            # Track Tokens (Optional but recommended for cost tracking)
+            vision_in_tokens += model.count_tokens([box['prompt'], pil_img]).total_tokens
+            vision_out_tokens += model.count_tokens(response.text).total_tokens
+
+    return raw_data, vision_in_tokens, vision_out_tokens
 
 # ==========================================
 # 5. LLM TEXT CORRECTION
@@ -336,11 +352,14 @@ def process_pipeline(start_index, end_index):
             except Exception as e: raise Exception(f"Identification Phase Failed: {str(e)}")
 
             # 3. Zonal OCR
-            try: raw_messy_dict = extract_zonal_data(aligned_img, form_type)
+            try: raw_messy_dict, vis_in, vis_out = extract_zonal_data(aligned_img, form_type)
             except Exception as e: raise Exception(f"Zonal OCR Phase Failed: {str(e)}")
 
             # 4. LLM Clean
-            try: clean_json, in_tok, out_tok = correct_data_with_llm(raw_messy_dict, form_type)
+            try: 
+                clean_json, clean_in, clean_out = correct_data_with_llm(raw_messy_dict, form_type)
+                total_in_tok = vis_in + clean_in
+                total_out_tok = vis_out + clean_out
             except Exception as e: raise Exception(f"LLM Formatting Phase Failed: {str(e)}")
 
             # 5. Routing & Save
@@ -359,7 +378,7 @@ def process_pipeline(start_index, end_index):
             df_inventory.loc[index, "Status"] = "SUCCESS"
             save_and_format_excel(df_inventory, LOCAL_INVENTORY, VOLUME_INVENTORY, table_name="Inventory")
             
-            log_token_usage_excel(file_name, in_tok, out_tok, "SUCCESS")
+            log_token_usage_excel(file_name, total_in_tok, total_out_tok, "SUCCESS")
             log_process_status(file_name, "SUCCESS")
 
         except Exception as e:
